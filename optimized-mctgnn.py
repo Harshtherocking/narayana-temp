@@ -9,40 +9,44 @@ from tqdm import tqdm
 import kagglehub
 import os
 import logging
-from torchdiffeq import odeint
+import gc
 import matplotlib.pyplot as plt
 from scipy.interpolate import CubicSpline
+import time
 import warnings
-import gc
-import psutil
 
-# Logging and device setup
+# Suppress warnings
+warnings.filterwarnings('ignore')
+
+# Logging setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Device configuration
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 if torch.cuda.is_available():
     print(f"CUDA Device: {torch.cuda.get_device_name(0)}")
-    print(f"Total VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-else:
-    raise RuntimeError("CUDA is not available. Please set runtime to GPU.")
+    print(f"PyTorch: {torch.__version__}, CUDA: {torch.version.cuda}")
+    
+    # Clear cache at start
+    torch.cuda.empty_cache()
+    
+    print("Memory status at start:")
+    print(f"Allocated: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
+    print(f"Cached: {torch.cuda.memory_reserved(0) / 1024**3:.2f} GB")
 
-# Enhanced constants for H100 GPU with 80GB VRAM
+# Constants - minimal for MIG setup
 NUM_NODES = 162
 IN_CHANNELS = 1
 MAX_SEQ_LENGTH = 5000
-BATCH_SIZE = 8  # Increased from 2 to better utilize H100
+BATCH_SIZE = 2
 LEARNING_RATE = 0.0005
 EPOCHS = 50
-HIDDEN_DIM = 64  # Increased from 32 to utilize more capacity
-SUBSAMPLE_FACTOR = 5  # Reduced from 10 for more accurate integration
+HIDDEN_DIM = 32
+SUBSAMPLE_FACTOR = 10
 
-# Enable performance optimizations
-torch.backends.cudnn.benchmark = True
-torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 on Ampere+ GPUs
-torch.backends.cudnn.allow_tf32 = True
-
-# Helper Functions
+# Data parsing function
 def parse_numeric_string(s):
     try:
         if not isinstance(s, str):
@@ -56,10 +60,11 @@ def parse_numeric_string(s):
         logger.warning(f"Failed to parse string: {s[:30]}... - Error: {str(e)}")
         return None
 
-# Dataset Class with optimized processing for large RAM
+# Simplified Dataset
 class NeuralSignalDataset(Dataset):
     def __init__(self, data_df, coords_df, max_seq_length=MAX_SEQ_LENGTH, normalize=True,
-                 chunk_min_size=20, max_chunks=200):  # Increased max_chunks to use more data
+                 chunk_min_size=20, max_chunks=50):
+        print("Initializing dataset...")
         self.data = data_df
         self.coords = coords_df
         self.max_seq_length = max_seq_length
@@ -70,130 +75,102 @@ class NeuralSignalDataset(Dataset):
         self.process_data()
 
     def process_data(self):
-        """Process the neural data into chunks based on stimulus changes with parallel processing."""
-        print("Chunking data dynamically based on stimulus changes...")
-        total_rows = len(self.data)
+        """Process the neural data into chunks based on stimulus changes."""
+        print("Chunking data based on activity changes...")
         chunked_data = []
         actual_lengths = []
         current_activity = None
         current_chunk = []
-
-        # Use larger buffer for faster processing with more RAM
-        buffer_size = 10000  # Process data in larger chunks
         
-        # Process row by row with optimized chunking
+        total_rows = len(self.data)
+        sample_size = min(total_rows, 50000)  # Limit sample size
+        
+        # Use smaller step to process less data
+        step = max(1, total_rows // sample_size)
         processed_count = 0
         skipped_count = 0
         chunk_count = 0
-
-        # Process in buffer chunks to utilize RAM efficiently
-        for buffer_start in range(0, total_rows, buffer_size):
-            buffer_end = min(buffer_start + buffer_size, total_rows)
-            buffer_data = self.data.iloc[buffer_start:buffer_end]
-            
-            progress_bar = tqdm(range(len(buffer_data)), 
-                               desc=f"Processing rows {buffer_start}-{buffer_end-1}")
-            
-            for idx in progress_bar:
-                try:
-                    electrode_str = buffer_data.iloc[idx]['data']
-                    electrode_values = parse_numeric_string(electrode_str)
-                    if electrode_values is None or len(electrode_values) != 194:
-                        skipped_count += 1
-                        continue
-                    
-                    electrode_values = electrode_values[self.valid_indices]
-                    if len(electrode_values) != NUM_NODES:
-                        skipped_count += 1
-                        continue
-
-                    activity = buffer_data.iloc[idx]['activity']
-                    processed_count += 1
-
-                    if current_activity is None:
-                        current_activity = activity
-                        current_chunk = [electrode_values]
-                    elif activity != current_activity:
-                        if len(current_chunk) > self.chunk_min_size and len(chunked_data) < self.max_chunks:
-                            chunked_data.append(np.vstack(current_chunk))
-                            actual_lengths.append(len(current_chunk))
-                            chunk_count += 1
-                        current_chunk = [electrode_values]
-                        current_activity = activity
-                    else:
-                        current_chunk.append(electrode_values)
-
-                    # Update progress bar description with stats
-                    if idx % 100 == 0:
-                        progress_bar.set_postfix({
-                            'processed': processed_count,
-                            'skipped': skipped_count,
-                            'chunks': chunk_count,
-                            'current_chunk_size': len(current_chunk)
-                        })
-
-                except Exception as e:
-                    logger.error(f"Error processing row {buffer_start + idx}: {str(e)}")
+        
+        # Process in steps to reduce memory usage
+        pbar = tqdm(range(0, total_rows, step), desc="Processing data")
+        for idx in pbar:
+            try:
+                electrode_str = self.data.iloc[idx]['data']
+                electrode_values = parse_numeric_string(electrode_str)
+                
+                if electrode_values is None or len(electrode_values) != 194:
                     skipped_count += 1
                     continue
-
-        # Process the last chunk if needed
+                
+                electrode_values = electrode_values[self.valid_indices]
+                activity = self.data.iloc[idx]['activity']
+                processed_count += 1
+                
+                if current_activity is None:
+                    current_activity = activity
+                    current_chunk = [electrode_values]
+                elif activity != current_activity:
+                    if len(current_chunk) > self.chunk_min_size and len(chunked_data) < self.max_chunks:
+                        chunked_data.append(np.vstack(current_chunk))
+                        actual_lengths.append(len(current_chunk))
+                        chunk_count += 1
+                    current_chunk = [electrode_values]
+                    current_activity = activity
+                else:
+                    current_chunk.append(electrode_values)
+                
+                # Update progress
+                if processed_count % 1000 == 0:
+                    pbar.set_postfix({
+                        'processed': processed_count,
+                        'chunks': chunk_count
+                    })
+                    
+                # Check if we have enough chunks
+                if chunk_count >= self.max_chunks:
+                    break
+            
+            except Exception as e:
+                logger.error(f"Error processing row {idx}: {str(e)}")
+                skipped_count += 1
+                continue
+        
+        # Process the last chunk
         if current_chunk and len(current_chunk) > self.chunk_min_size and len(chunked_data) < self.max_chunks:
             chunked_data.append(np.vstack(current_chunk))
             actual_lengths.append(len(current_chunk))
-            chunk_count += 1
-
+        
         if not chunked_data:
-            raise ValueError("No valid data chunks processed.")
-
-        print(f"Processing complete! Found {processed_count} valid rows, created {chunk_count} chunks")
-
-        # Setup progress bar for padding and processing
-        print("Preparing final dataset...")
+            raise ValueError("No valid data chunks found")
+        
+        print(f"Found {processed_count} valid rows, created {len(chunked_data)} chunks")
+        
+        # Process chunks into dataset
         self.electrode_data = []
         self.actual_lengths = []
-
-        # Process in parallel with larger batch size
-        for chunk_idx, (chunk, actual_length) in enumerate(zip(chunked_data, actual_lengths)):
-            print(f"Processing chunk {chunk_idx+1}/{len(chunked_data)}, length={actual_length}")
+        
+        for chunk, actual_length in zip(chunked_data, actual_lengths):
             if actual_length > self.max_seq_length:
                 self.electrode_data.append(chunk[:self.max_seq_length])
                 self.actual_lengths.append(self.max_seq_length)
             else:
                 pad_len = self.max_seq_length - actual_length
-                self.electrode_data.append(np.pad(chunk, ((0, pad_len), (0, 0)), mode='constant'))
+                padded = np.pad(chunk, ((0, pad_len), (0, 0)), mode='constant')
+                self.electrode_data.append(padded)
                 self.actual_lengths.append(actual_length)
-
-        # Using NumPy's optimized stacking for large arrays
+        
+        # Stack data
+        print("Stacking data...")
         self.electrode_data = np.stack(self.electrode_data)
-        print(f"Stacked data shape before normalization: {self.electrode_data.shape}")
-
+        
+        # Normalize data
         if self.normalize:
             print("Normalizing data...")
-            try:
-                # Process in chunks to handle large arrays efficiently
-                batch_size = 10  # Process 10 chunks at a time
-                for i in range(0, len(self.electrode_data), batch_size):
-                    batch_end = min(i + batch_size, len(self.electrode_data))
-                    batch = self.electrode_data[i:batch_end]
-                    
-                    reshaped_batch = batch.reshape(-1, NUM_NODES)
-                    scaler = StandardScaler()
-                    normalized_batch = scaler.fit_transform(reshaped_batch)
-                    self.electrode_data[i:batch_end] = normalized_batch.reshape(batch.shape)
-                    
-                    # Force garbage collection after each batch
-                    del batch, reshaped_batch, normalized_batch, scaler
-                    gc.collect()
-                    
-            except Exception as e:
-                logger.error(f"Error during normalization: {str(e)}")
-                # If standard scaling fails, use a simpler approach
-                mean = np.mean(self.electrode_data)
-                std = np.std(self.electrode_data) + 1e-8
-                self.electrode_data = (self.electrode_data - mean) / std
-
-        print(f"Dataset preparation complete! Final shape: {self.electrode_data.shape}")
+            mean = np.mean(self.electrode_data)
+            std = np.std(self.electrode_data) + 1e-8
+            self.electrode_data = (self.electrode_data - mean) / std
+        
+        print(f"Dataset prepared. Shape: {self.electrode_data.shape}")
 
     def __len__(self):
         return len(self.electrode_data)
@@ -203,522 +180,396 @@ class NeuralSignalDataset(Dataset):
         actual_length = self.actual_lengths[idx]
         return torch.FloatTensor(sequences).unsqueeze(-1), torch.tensor(actual_length, dtype=torch.long)
 
-# Optimized GNN Function for ODE integration
+# Simplified GNN function
 class StableGNNFunc(nn.Module):
     def __init__(self, hidden_dim, adj_matrix):
         super(StableGNNFunc, self).__init__()
         self.hidden_dim = hidden_dim
-        self.register_buffer("adj_matrix", adj_matrix.clone())  # Register as buffer for better CUDA management
-
-        # Multi-layer GNN with additional capacity
+        self.register_buffer('adj_matrix', adj_matrix)
+        
+        # Simpler network architecture
         self.gnn_layer = nn.Sequential(
-            nn.Linear(2 * hidden_dim, hidden_dim * 2),  # Wider network
-            nn.LayerNorm(hidden_dim * 2),
-            nn.SiLU(),  # SiLU is smoother than ReLU
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim)
+            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim)
         )
-
-        # Activity-state dynamics with deeper networks
+        
         self.dx_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh()  # Bounded activation for stability
+            nn.Tanh()
         )
-
-        # Memory-state dynamics with deeper networks
+        
         self.dm_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh()  # Bounded activation for stability
+            nn.Tanh()
         )
-
-        # Coefficients tuned for neuronal dynamics
-        self.diffusion_coef = 0.02  # Spatial spread parameter
-        self.decay_coef = 0.03     # Neural decay parameter
-        self.scale_factor = 2.0    # Overall dynamics speed
+        
+        # Model parameters
+        self.diffusion_coef = 0.02
+        self.decay_coef = 0.03
+        self.scale_factor = 1.0
 
     def forward(self, t, z):
-        # Get shape info
+        # Extract states
         batch_size, num_nodes, total_dim = z.shape
-        device_z = z.device
-
-        # Make sure tensors are on the correct device
-        if self.adj_matrix.device != device_z:
-            self.adj_matrix = self.adj_matrix.to(device_z)
-
-        assert total_dim == 2 * self.hidden_dim, f"Expected dim {2 * self.hidden_dim}, got {total_dim}"
-
-        # State decomposition
-        x = z[:, :, :self.hidden_dim]  # Neural activity state
+        x = z[:, :, :self.hidden_dim]  # Neural activity
         m = z[:, :, self.hidden_dim:]  # Memory component
-
-        # Check for NaN inputs
-        if torch.isnan(z).any():
-            x = torch.nan_to_num(x, nan=0.0)
-            m = torch.nan_to_num(m, nan=0.0)
-
+        
         # Concatenate states
         z_cat = torch.cat([x, m], dim=-1)
-
-        # Apply GNN layer
+        
+        # Apply GNN transformation
         transformed = self.gnn_layer(z_cat)
-
-        # Normalize to prevent extreme values
+        
+        # Normalize output
         transformed = F.normalize(transformed, p=2, dim=-1) * (self.hidden_dim**0.5)
-
-        # Graph diffusion - node interactions through adjacency matrix
+        
+        # Apply graph diffusion
         neighbor_influence = torch.matmul(self.adj_matrix.float(), transformed)
-
-        # Calculate dynamics with scale factor
+        
+        # Calculate dynamics
         dx_dt = self.scale_factor * self.dx_head(
             transformed + self.diffusion_coef * neighbor_influence - self.decay_coef * x
         )
+        
         dm_dt = self.scale_factor * self.dm_head(
             transformed + self.diffusion_coef * neighbor_influence
         )
-
-        # Combine state derivatives
+        
+        # Combine derivatives
         dz_dt = torch.cat([dx_dt, dm_dt], dim=-1)
-
-        # Gradient norm clipping for stability
+        
+        # Clip gradients for stability
         norm = torch.norm(dz_dt, dim=-1, keepdim=True)
-        max_norm = 10.0  # Max gradient magnitude
+        max_norm = 5.0
         scale = torch.clamp(max_norm / (norm + 1e-8), max=1.0)
         dz_dt = dz_dt * scale
-
-        # Safety check for NaN and replace if necessary
+        
+        # Check for NaNs
         if torch.isnan(dz_dt).any():
-            dz_dt = torch.nan_to_num(dz_dt, nan=0.0)
-
+            dz_dt = torch.nan_to_num(dz_dt)
+            
         return dz_dt
 
-# Neural ODE with cubic spline interpolation
-class StableNeuralODEGNN(nn.Module):
+# Simple neural ODE implementation
+class SimpleNeuralODEGNN(nn.Module):
     def __init__(self, in_channels, hidden_dim, adj_matrix):
-        super(StableNeuralODEGNN, self).__init__()
+        super(SimpleNeuralODEGNN, self).__init__()
         self.hidden_dim = hidden_dim
-        self.register_buffer("adj_matrix", adj_matrix.clone())  # Register as buffer
-
-        # Deeper encoder network for better initial conditions
+        self.register_buffer('adj_matrix', adj_matrix)
+        
+        # Simple encoder
         self.encoder = nn.Sequential(
             nn.Linear(in_channels, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim * 2),
-            nn.LayerNorm(hidden_dim * 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim * 2, hidden_dim * 2),
-            nn.LayerNorm(hidden_dim * 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim * 2, 2 * hidden_dim)
+            nn.Linear(hidden_dim, 2 * hidden_dim)
         )
-
+        
+        # ODE function
         self.ode_func = StableGNNFunc(hidden_dim, adj_matrix)
-
-    def cubic_spline_interpolation(self, solution, integration_time, full_time, batch_size, num_nodes):
-        """Apply cubic spline interpolation to the ODE solution."""
-        print("Performing cubic spline interpolation...")
+    
+    def simple_integration(self, z0, seq_len, dt=1.0):
+        """Simple Euler integration for ODE"""
+        print("Using simple Euler integration...")
+        batch_size, num_nodes, total_dim = z0.shape
         
-        # Move to CPU for scipy interpolation (necessary as scipy doesn't work on GPU)
-        solution_cpu = solution.detach().cpu().numpy()
-        integration_time_cpu = integration_time.detach().cpu().numpy()
-        full_time_cpu = full_time.detach().cpu().numpy()
+        # Initialize solution
+        solution = torch.zeros(seq_len, batch_size, num_nodes, total_dim, device=z0.device)
+        solution[0] = z0
         
-        # Create the output buffer
-        full_solution = torch.zeros(
-            len(full_time_cpu), batch_size, num_nodes, 2 * self.hidden_dim, 
-            device=solution.device
-        )
-        
-        # Process in batches to efficiently use memory
-        batch_increment = 2  # Process 2 samples at a time
-        for b_start in range(0, batch_size, batch_increment):
-            b_end = min(b_start + batch_increment, batch_size)
+        # Step through time
+        z = z0
+        for t in range(1, seq_len):
+            t_tensor = torch.tensor(float(t), device=z.device)
+            dz = self.ode_func(t_tensor, z) * dt
+            z = z + dz
+            solution[t] = z
             
-            # Process each node for this batch
-            for n in range(num_nodes):
-                # Process each feature dimension
-                for d in range(2 * self.hidden_dim):
-                    # Create spline for each feature in current batch/node
-                    for b in range(b_start, b_end):
-                        # Extract values for this specific batch, node, dimension
-                        y_values = solution_cpu[:, b, n, d]
-                        
-                        # Create cubic spline interpolator
-                        cs = CubicSpline(integration_time_cpu, y_values)
-                        
-                        # Interpolate at desired timepoints
-                        interpolated = cs(full_time_cpu)
-                        
-                        # Store results back in tensor
-                        full_solution[:, b, n, d] = torch.tensor(
-                            interpolated, device=solution.device
-                        )
+            # Clean up periodically
+            if t % 500 == 0:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         
-        print("Cubic spline interpolation complete.")
-        return full_solution
-
+        return solution
+    
     def forward(self, x):
         batch_size, seq_len, num_nodes, channels = x.shape
-
-        # Get initial state from first time step
+        
+        # Encode initial state
         initial_x = x[:, 0, :, :]
         z0 = self.encoder(initial_x)
+        
+        # Integrate ODE
+        try:
+            # Simple integration
+            full_solution = self.simple_integration(z0, seq_len)
+            
+            return full_solution
+            
+        except Exception as e:
+            logger.error(f"Integration error: {str(e)}")
+            # Fallback to simple integration
+            full_solution = self.simple_integration(z0, seq_len)
+            return full_solution
 
-        # Create integration time points
-        integration_time = torch.linspace(0, seq_len-1, seq_len//SUBSAMPLE_FACTOR + 1, dtype=torch.float32).to(device)
-
-        print(f"Starting ODE integration with {len(integration_time)} time points...")
-
-        # Suppress warnings during integration
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=UserWarning)
-
-            try:
-                # Use dopri5 solver with careful tolerance settings
-                solution = odeint(
-                    self.ode_func,
-                    z0,
-                    integration_time,
-                    method='dopri5',
-                    rtol=1e-3,
-                    atol=1e-4,
-                    options={'max_num_steps': 10000}  # Allow more steps for complex dynamics
-                )
-
-                print(f"ODE integration complete. Solution shape: {solution.shape}")
-
-                # Check for NaN values in the solution
-                if torch.isnan(solution).any():
-                    print("Warning: NaN values detected in ODE solution. Replacing with zeros.")
-                    solution = torch.nan_to_num(solution, nan=0.0)
-
-                # Create full time points for interpolation
-                full_time = torch.arange(seq_len, dtype=torch.float32).to(device)
-                
-                # Apply cubic spline interpolation (our new method)
-                full_solution = self.cubic_spline_interpolation(
-                    solution, integration_time, full_time, batch_size, num_nodes
-                )
-
-                return full_solution
-
-            except Exception as e:
-                logger.error(f"ODE integration failed: {str(e)}")
-                print(f"Error during dopri5 integration: {str(e)}. Falling back to euler method.")
-
-                # Fall back to euler method
-                try:
-                    solution = odeint(
-                        self.ode_func,
-                        z0,
-                        integration_time,
-                        method='euler',
-                        rtol=1e-2,
-                        atol=1e-3
-                    )
-
-                    # Create full time points for interpolation
-                    full_time = torch.arange(seq_len, dtype=torch.float32).to(device)
-                    
-                    # Apply cubic spline interpolation
-                    full_solution = self.cubic_spline_interpolation(
-                        solution, integration_time, full_time, batch_size, num_nodes
-                    )
-                    
-                    return full_solution
-
-                except Exception as e2:
-                    logger.error(f"Fallback integration also failed: {str(e2)}")
-                    print("Using simple time-stepping as final fallback")
-
-                    # Ultimate fallback - simple forward evolution
-                    full_solution = torch.zeros(seq_len, batch_size, num_nodes, 2 * self.hidden_dim, device=device)
-                    state = z0
-                    full_solution[0] = state
-
-                    for t in range(1, seq_len):
-                        # Simple Euler step
-                        derivative = self.ode_func(torch.tensor(float(t), device=device), state)
-                        state = state + derivative * 1.0  # dt = 1.0
-                        full_solution[t] = state
-
-                        # Periodically clean up memory
-                        if t % 500 == 0:
-                            torch.cuda.empty_cache()
-
-                    return full_solution
-
-# Enhanced Temporal GNN - with increased capacity
-class EnhancedTemporalGNN(nn.Module):
+# Main model
+class SimpleTemporalGNN(nn.Module):
     def __init__(self, in_channels, hidden_dim, adj_matrix):
-        super(EnhancedTemporalGNN, self).__init__()
-        self.neural_ode_gnn = StableNeuralODEGNN(in_channels, hidden_dim, adj_matrix)
-
-        # Enhanced multi-layer decoder
+        super(SimpleTemporalGNN, self).__init__()
+        self.neural_ode_gnn = SimpleNeuralODEGNN(in_channels, hidden_dim, adj_matrix)
+        
+        # Simple decoder
         self.decoder = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 2),
-            nn.LayerNorm(hidden_dim * 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, in_channels)
         )
-
+    
     def forward(self, x):
         # Get ODE solution
         solution = self.neural_ode_gnn(x)
-
+        
         # Extract activity state
         pred_x = solution[:, :, :, :self.neural_ode_gnn.hidden_dim]
-
-        # Apply decoder to get predictions
-        pred_observations = self.decoder(pred_x)
-
+        
+        # Apply decoder
+        batch_size = x.shape[0]
+        seq_len = x.shape[1]
+        num_nodes = x.shape[2]
+        
+        # Reshape for decoder
+        pred_x_flat = pred_x.view(-1, self.neural_ode_gnn.hidden_dim)
+        pred_obs_flat = self.decoder(pred_x_flat)
+        pred_obs = pred_obs_flat.view(seq_len, batch_size, num_nodes, -1)
+        
         # Permute to match expected shape
-        pred_sequences = pred_observations.permute(1, 0, 2, 3)
-
+        pred_sequences = pred_obs.permute(1, 0, 2, 3)
+        
         return pred_sequences, solution
 
-# Create optimized correlation adjacency matrix
-def create_correlation_adjacency_matrix(data, valid_indices, n_samples=100000, threshold=0.5):
-    """Creates optimized correlation adjacency matrix using more data points"""
-    print(f"Computing correlation adjacency matrix across {n_samples} timestamps...")
+# Function to create adjacency matrix
+def create_simple_adjacency_matrix(n_electrodes, threshold=0.5):
+    """Create a simple adjacency matrix based on node proximity"""
+    print("Creating simple adjacency matrix...")
+    
+    # Just make a fully connected graph with self-loops removed
+    adj_matrix = torch.ones(n_electrodes, n_electrodes, dtype=torch.float32)
+    adj_matrix.fill_diagonal_(0)  # Remove self-loops
+    
+    print(f"Created adjacency matrix with {adj_matrix.sum().item()} edges")
+    return adj_matrix
 
-    # Process in chunks to optimize memory usage
-    chunk_size = 5000
-    sample_data_chunks = []
-    
-    for chunk_start in range(0, min(n_samples, len(data)), chunk_size):
-        chunk_end = min(chunk_start + chunk_size, min(n_samples, len(data)))
-        print(f"Processing correlation chunk {chunk_start}-{chunk_end}")
-        
-        chunk_samples = []
-        for idx in tqdm(range(chunk_start, chunk_end), desc=f"Building correlation matrix chunk {chunk_start}-{chunk_end}"):
-            try:
-                electrode_str = data.iloc[idx]['data']
-                electrode_values = parse_numeric_string(electrode_str)
-                if electrode_values is not None and len(electrode_values) == 194:
-                    chunk_samples.append(electrode_values[valid_indices])
-            except Exception as e:
-                logger.error(f"Error processing index {idx}: {str(e)}")
-                continue
-                
-        if chunk_samples:
-            sample_data_chunks.append(np.array(chunk_samples).T)
-            
-    # Combine chunks efficiently
-    if not sample_data_chunks:
-        raise ValueError("No valid samples collected for adjacency matrix")
-    
-    # Compute correlations in chunks for memory efficiency
-    corr_matrices = []
-    
-    for chunk in sample_data_chunks:
-        chunk_corr = np.corrcoef(chunk)
-        chunk_corr = np.nan_to_num(chunk_corr)
-        corr_matrices.append(chunk_corr)
-    
-    # Average the correlation matrices
-    corr_matrix = np.mean(corr_matrices, axis=0)
-    
-    print(f"Creating adjacency matrix with threshold {threshold}...")
-    adj_matrix = (np.abs(corr_matrix) > threshold).astype(np.float32)
-    np.fill_diagonal(adj_matrix, 0)
-
-    edges = adj_matrix.sum()
-    print(f"Created adjacency matrix with {edges} edges")
-
-    return torch.FloatTensor(adj_matrix).to(device)
-
-# Main function with optimized training for H100
 def main():
     try:
         os.makedirs("results", exist_ok=True)
+        print("\n=== Starting MCTGNN - Minimal Version ===\n")
         
-        # Add memory reporting for better monitoring
-        print("\n===== SYSTEM RESOURCES =====")
-        print(f"CPU RAM: {psutil.virtual_memory().total / (1024**3):.2f} GB")
-        print(f"GPU VRAM: {torch.cuda.get_device_properties(0).total_memory / (1024**3):.2f} GB")
-        print(f"CUDA Version: {torch.version.cuda}")
-        print(f"PyTorch Version: {torch.__version__}")
-        print("===========================\n")
-
-        # Optimize performance for H100
-        torch.cuda.empty_cache()  # Clear GPU cache before starting
-        
-        # Set larger limits for GPU operations
-        torch.cuda.set_per_process_memory_fraction(0.95)  # Use 95% of available VRAM
-
-        # Data loading
+        # Load coordinates
         print("Loading electrode coordinates...")
-        coords_path = kagglehub.dataset_download("arunramponnambalam/electrodes-coordinates")
-        coords_file = os.path.join(coords_path, "electrodesdata.csv")
-        coords = pd.read_csv(coords_file, usecols=[0, 1, 2], names=['x', 'y', 'z'], header=0)
-        valid_indices = [i for i in range(len(coords)) if i not in [0, 16, 23, 24, 26, 31, 38, 63, 92, 96, 99, 100, 101, 102, 108, 111, 112, 113, 114, 122, 128, 129, 139, 142, 145, 146, 147, 148, 170, 177, 192, 193]]
-        coords = coords.iloc[valid_indices].reset_index(drop=True)
-
+        try:
+            coords_path = kagglehub.dataset_download("arunramponnambalam/electrodes-coordinates")
+            coords_file = os.path.join(coords_path, "electrodesdata.csv")
+            coords = pd.read_csv(coords_file, usecols=[0, 1, 2], names=['x', 'y', 'z'], header=0)
+            valid_indices = [i for i in range(len(coords)) if i not in [0, 16, 23, 24, 26, 31, 38, 63, 92, 96, 99, 100, 101, 102, 108, 111, 112, 113, 114, 122, 128, 129, 139, 142, 145, 146, 147, 148, 170, 177, 192, 193]]
+            coords = coords.iloc[valid_indices].reset_index(drop=True)
+            print(f"Loaded coordinates for {len(coords)} electrodes")
+        except Exception as e:
+            logger.error(f"Error loading coordinates: {str(e)}")
+            print("Using dummy coordinates")
+            # Create dummy coordinates
+            coords = pd.DataFrame({
+                'x': np.random.randn(NUM_NODES),
+                'y': np.random.randn(NUM_NODES),
+                'z': np.random.randn(NUM_NODES)
+            })
+        
+        # Load activity data
         print("Loading neural activity data...")
-        data_path = kagglehub.dataset_download("nocopyrights/image-stimulus-timestamp-data")
-        data_file = os.path.join(data_path, "merged_data.csv")
-        data = pd.read_csv(data_file)
-        print(f"Loaded dataset with {len(data)} samples")
-
-        data = data[~(data['activity'].str.startswith('sscr', na=False) | data['activity'].str.startswith('sscr2', na=False))].reset_index(drop=True)
-        print(f"Dataset after filtering: {len(data)} samples")
-
-        print("Creating adjacency matrix...")
-        adj_matrix = create_correlation_adjacency_matrix(data, valid_indices)
-
-        print("Initializing dataset...")
-        dataset = NeuralSignalDataset(data, coords)
-
-        # Free up memory
+        try:
+            data_path = kagglehub.dataset_download("nocopyrights/image-stimulus-timestamp-data")
+            data_file = os.path.join(data_path, "merged_data.csv")
+            data = pd.read_csv(data_file)
+            print(f"Loaded dataset with {len(data)} samples")
+            data = data[~(data['activity'].str.startswith('sscr', na=False) | data['activity'].str.startswith('sscr2', na=False))].reset_index(drop=True)
+            print(f"Dataset after filtering: {len(data)} samples")
+        except Exception as e:
+            logger.error(f"Error loading data: {str(e)}")
+            raise RuntimeError(f"Failed to load data: {str(e)}")
+        
+        # Create simple adjacency matrix
+        adj_matrix = create_simple_adjacency_matrix(NUM_NODES)
+        adj_matrix = adj_matrix.to(device)
+        
+        # Create dataset
+        try:
+            dataset = NeuralSignalDataset(data, coords, max_chunks=10)  # Limit to 10 chunks for speed
+        except Exception as e:
+            logger.error(f"Error creating dataset: {str(e)}")
+            raise RuntimeError(f"Failed to create dataset: {str(e)}")
+        
+        # Free memory
         del data
         gc.collect()
-        torch.cuda.empty_cache()
-
-        print("Creating data loader...")
-        try:
-            # Use more workers to better utilize CPU cores
-            train_loader = DataLoader(
-                dataset, 
-                batch_size=BATCH_SIZE, 
-                shuffle=True, 
-                num_workers=6,  # Use more CPU cores
-                pin_memory=True,
-                prefetch_factor=4  # Prefetch more batches
-            )
-        except Exception as e:
-            print(f"Error with multiple workers: {str(e)}, trying with 2 workers")
-            train_loader = DataLoader(
-                dataset, 
-                batch_size=BATCH_SIZE, 
-                shuffle=True, 
-                num_workers=2, 
-                pin_memory=True
-            )
-
-        # Use mixed precision training for speed
-        scaler = torch.cuda.amp.GradScaler()
-
-        # Model initialization and training setup
-        print("Initializing model...")
-        model = EnhancedTemporalGNN(IN_CHANNELS, HIDDEN_DIM, adj_matrix).to(device)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
-        # Print model size and parameters
-        model_params = sum(p.numel() for p in model.parameters())
-        print(f"Model has {model_params:,} parameters")
-
-        # Use AdamW with carefully tuned parameters
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=LEARNING_RATE,
-            weight_decay=1e-6,
-            eps=1e-8
+        # Create data loader (single process)
+        train_loader = DataLoader(
+            dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+            num_workers=0
         )
-
-        # Learning rate scheduler for better convergence
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=LEARNING_RATE * 10,
-            total_steps=EPOCHS * len(train_loader),
-            pct_start=0.3,
-            anneal_strategy='cos'
-        )
-
-        # Keep track of best model
-        best_loss = float('inf')
-        best_model_state = None
-
-        # Training loop
-        print("Starting training...")
-        for epoch in range(EPOCHS):
+        
+        # Initialize model
+        print("Creating model...")
+        model = SimpleTemporalGNN(IN_CHANNELS, HIDDEN_DIM, adj_matrix).to(device)
+        
+        # Print model parameters
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"Model has {total_params:,} parameters")
+        
+        # Optimizer
+        optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+        
+        # Train model
+        print("\n=== Beginning Training ===\n")
+        
+        for epoch in range(1):  # Just one epoch for testing
+            print(f"Epoch {epoch+1}/{EPOCHS}")
+            
+            # Training loop
             model.train()
             total_loss = 0
             batch_count = 0
-
-            # Training loop with progress bar
-            train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
-
-            for sequences, actual_lengths in train_pbar:
+            
+            for sequences, actual_lengths in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
                 try:
+                    # Move data to device
                     sequences = sequences.to(device)
                     actual_lengths = actual_lengths.to(device)
-
-                    # Zero gradients
+                    
+                    # Forward pass
                     optimizer.zero_grad()
-
-                    # Use automatic mixed precision for faster training
-                    with torch.cuda.amp.autocast():
-                        # Forward pass
-                        pred_sequences, _ = model(sequences)
-
-                        # Create mask for sequence lengths
-                        batch_size, seq_len, _, _ = sequences.shape
-                        mask = torch.zeros(batch_size, seq_len, device=device)
-                        for b in range(batch_size):
-                            mask[b, :actual_lengths[b]] = 1
-
-                        # Masked loss calculation
-                        loss = ((pred_sequences - sequences) ** 2 * mask.unsqueeze(-1).unsqueeze(-1)).sum() / (mask.sum() * NUM_NODES * IN_CHANNELS)
-
-                        # Check for NaN loss
+                    
+                    # Get predictions
+                    pred_sequences, _ = model(sequences)
+                    
+                    # Create mask for actual sequence lengths
+                    batch_size, seq_len, _, _ = sequences.shape
+                    mask = torch.zeros(batch_size, seq_len, device=device)
+                    for b in range(batch_size):
+                        mask[b, :actual_lengths[b]] = 1
+                    
+                    # Compute loss
+                    loss = ((pred_sequences - sequences) ** 2 * mask.unsqueeze(-1).unsqueeze(-1)).sum() / (mask.sum() * NUM_NODES * IN_CHANNELS)
+                    
+                    # Check for NaN loss
                     if torch.isnan(loss) or torch.isinf(loss):
                         print("Invalid loss detected, skipping batch")
-                        # Try to recover by reinitializing the last batch
-                        torch.cuda.empty_cache()
                         continue
-
-                    # Backward pass and optimization with mixed precision
-                    scaler.scale(loss).backward()
-
-                    # Conservative gradient clipping
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-
-                    scaler.step(optimizer)
-                    scaler.update()
-                    scheduler.step()
-
-                    # Update statistics
+                    
+                    # Backward pass
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    
+                    # Update stats
                     total_loss += loss.item()
                     batch_count += 1
-
-                    # Update progress bar
-                    train_pbar.set_postfix({
-                        'loss': loss.item(), 
-                        'lr': optimizer.param_groups[0]['lr']
-                    })
-
-                    # Free GPU memory periodically
-                    if batch_count % 10 == 0:
+                    
+                    # Report progress
+                    if batch_count % 5 == 0:
+                        print(f"Batch {batch_count}, Loss: {loss.item():.6f}")
+                    
+                    # Clean up memory
+                    if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-
+                    
                 except Exception as e:
-                    logger.error(f"Error during training batch: {str(e)}")
-                    torch.cuda.empty_cache()  # Clean up after error
+                    logger.error(f"Error in training batch: {str(e)}")
+                    print(f"Batch error: {str(e)}")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     continue
-
-            # Calculate average loss
-            avg_loss = total_loss / max(1, batch_count)
-            print(f"Epoch [{epoch+1}/{EPOCHS}], Reconstruction Loss: {avg_loss:.4f}")
-
-            # Save best model
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                best_model_state = {
+            
+            # Report epoch results
+            if batch_count > 0:
+                avg_loss = total_loss / batch_count
+                print(f"Epoch {epoch+1} complete. Average loss: {avg_loss:.6f}")
+            else:
+                print("No valid batches in this epoch")
+            
+            # Save model
+            try:
+                checkpoint = {
                     'epoch': epoch,
-                    'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'loss': avg_loss
+                    'model_state': model.state_dict(),
+                    'optimizer_state': optimizer.state_dict()
                 }
-                print(f"New best model saved! Loss: {best_loss:.4f}")
-                # Save checkpoint for recovery
-                torch.save(best_model_state, f"results/ecog_ode_model_checkpoint_epoch{epoch}.pt")
+                torch.save(checkpoint, f"results/minimal_model_epoch{epoch+1}.pt")
+                print(f"Model saved to results/minimal_model_epoch{epoch+1}.pt")
+            except Exception as e:
+                logger.error(f"Error saving model: {str(e)}")
+        
+        print("\n=== Training Complete ===\n")
+        
+        # Evaluate model
+        print("Running quick evaluation...")
+        model.eval()
+        
+        with torch.no_grad():
+            # Just evaluate on first batch
+            for sequences, actual_lengths in train_loader:
+                sequences = sequences.to(device)
+                actual_lengths = actual_lengths.to(device)
+                
+                # Get predictions
+                pred_sequences, _ = model(sequences)
+                
+                # Simple visualization
+                sample_idx = 0
+                node_idx = 0
+                
+                # Extract sequence
+                actual_length = actual_lengths[sample_idx].item()
+                actual_values = sequences[sample_idx, :actual_length, node_idx, 0].cpu().numpy()
+                pred_values = pred_sequences[sample_idx, :actual_length, node_idx, 0].cpu().numpy()
+                
+                # Plot
+                plt.figure(figsize=(10, 6))
+                plt.plot(actual_values, label='Actual')
+                plt.plot(pred_values, label='Predicted')
+                plt.title(f"Neural Activity: Node {node_idx}")
+                plt.xlabel("Time")
+                plt.ylabel("Activity")
+                plt.legend()
+                plt.savefig("results/minimal_evaluation.png")
+                plt.close()
+                
+                print("Evaluation plot saved to results/minimal_evaluation.png")
+                break
+        
+        print("Done!")
+        
+    except Exception as e:
+        logger.error(f"Main function error: {str(e)}")
+        print(f"Fatal error: {str(e)}")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+if __name__ == "__main__":
+    # Set specific torch settings for stability
+    torch.set_num_threads(1)  # Limit CPU threads
+    if torch.cuda.is_available():
+        torch.cuda.set_device(0)  # Ensure using first GPU
+    
+    try:
+        start_time = time.time()
+        main()
+        end_time = time.time()
+        print(f"Total runtime: {end_time - start_time:.2f} seconds")
+    except Exception as e:
+        print(f"Fatal error in main program: {str(e)}")
